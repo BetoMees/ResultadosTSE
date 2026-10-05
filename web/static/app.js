@@ -1059,8 +1059,10 @@ function renderElections(payload) {
 }
 
 let jobPollTimer = null;
+let jobPollTicks = 0;
 function pollJob() {
   if (jobPollTimer) return;
+  jobPollTicks = 0;
   jobPollTimer = setInterval(async () => {
     try {
       const job = await j("/api/downloads/status");
@@ -1077,6 +1079,13 @@ function pollJob() {
       if (!busy) {
         clearInterval(jobPollTimer);
         jobPollTimer = null;
+        jobPollTicks = 0;
+        await refresh();
+        return;
+      }
+      // A cada ~9s atualiza cards/KPIs enquanto o SQLite recebe logs.
+      jobPollTicks += 1;
+      if (jobPollTicks % 3 === 0) {
         await refresh();
       }
     } catch (_) {

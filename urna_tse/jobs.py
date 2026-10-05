@@ -493,6 +493,8 @@ class DownloadJobManager:
 
 
 _COVERAGE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_COVERAGE_TTL_IDLE = 8.0
+_COVERAGE_TTL_BUSY = 2.0
 
 
 def election_coverage(election: dict[str, Any]) -> dict[str, Any]:
@@ -500,8 +502,13 @@ def election_coverage(election: dict[str, Any]) -> dict[str, Any]:
     db_path = DATA / election["db_filename"]
     cache_key = f"{election.get('id')}|{election.get('mode')}|{db_path.name}"
     now = time.time()
+    try:
+        busy = JOBS.status().get("status") in ("running", "starting", "stopping")
+    except Exception:  # noqa: BLE001
+        busy = False
+    ttl = _COVERAGE_TTL_BUSY if busy else _COVERAGE_TTL_IDLE
     hit = _COVERAGE_CACHE.get(cache_key)
-    if hit and now - hit[0] < 8.0:
+    if hit and now - hit[0] < ttl:
         return dict(hit[1])
 
     expected = default_ufs()

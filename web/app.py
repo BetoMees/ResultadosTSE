@@ -63,6 +63,14 @@ def cached(ttl: float = TTL):
     def deco(fn: Callable):
         @wraps(fn)
         def inner(*args, **kwargs):
+            # Durante download, não servir cache — KPIs/cobertura mudam a cada commit no SQLite.
+            try:
+                job = JOBS.status()
+                downloading = job.get("status") in ("running", "starting", "stopping")
+            except Exception:  # noqa: BLE001
+                downloading = False
+            if downloading:
+                return fn(*args, **kwargs)
             # Inclui o DB ativo na chave — senão "Ver no painel" reaproveita cache da eleição anterior.
             key = (
                 fn.__name__
