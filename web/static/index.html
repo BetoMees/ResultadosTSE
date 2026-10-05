@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Urna TSE — estatísticas</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body>
+  <header class="top" id="top">
+    <div>
+      <p class="eyebrow">Resultados TSE · logs da urna</p>
+      <h1>Urna TSE</h1>
+      <p class="lede">Painel de estatísticas do download e dos votos a Presidente.</p>
+    </div>
+    <div class="top-meta" id="metaLine">carregando…</div>
+  </header>
+
+  <nav class="sticky-nav" id="stickyNav" aria-label="Abas do painel">
+    <div class="nav-links" role="tablist">
+      <button type="button" class="nav-link active" role="tab" aria-selected="true" data-tab="visao-geral" id="tab-visao-geral">Visão geral</button>
+      <button type="button" class="nav-link" role="tab" aria-selected="false" data-tab="presidente" id="tab-presidente">Presidente</button>
+      <button type="button" class="nav-link" role="tab" aria-selected="false" data-tab="modelos" id="tab-modelos">Modelos de urna</button>
+      <button type="button" class="nav-link" role="tab" aria-selected="false" data-tab="apuracao" id="tab-apuracao">Apuração</button>
+    </div>
+    <div class="nav-filter">
+      <span class="pill filter-pill hidden" id="modeloFilterPill"></span>
+      <button type="button" class="btn-clear hidden" id="btnClearModelo">Limpar filtro</button>
+    </div>
+  </nav>
+
+  <main>
+    <section class="tab-panel active" id="visao-geral" role="tabpanel" aria-labelledby="tab-visao-geral">
+      <div class="panel-head">
+        <h2>Visão geral</h2>
+        <p class="panel-sub">Cobertura do download de logs e arquivos auxiliares.</p>
+      </div>
+      <div class="kpis" id="kpis"></div>
+      <article class="card download-card">
+        <div class="card-head">
+          <h3>Downloads por eleição</h3>
+          <div class="filter-bar">
+            <button type="button" class="btn-secondary" id="btnRefresh">Atualizar painel</button>
+          </div>
+        </div>
+        <p class="hint" id="downloadJobLine">Nenhum download em andamento.</p>
+        <div class="election-grid" id="electionGrid"></div>
+      </article>
+      <details class="card glossary">
+        <summary>
+          <span>O que são AUX, logs e os outros arquivos?</span>
+          <span class="glossary-toggle">mostrar</span>
+        </summary>
+        <div class="glossary-grid">
+          <div>
+            <h3>CS (config de seções)</h3>
+            <p>Lista oficial de todas as seções eleitorais da UF (município → zona → seção). É o “mapa” do que existe para baixar.</p>
+          </div>
+          <div>
+            <h3>AUX (<code>*-aux.json</code>)</h3>
+            <p>Arquivo auxiliar de cada seção. Diz se a seção já foi <strong>totalizada</strong> e traz os <strong>hashes</strong> + nomes dos arquivos gerados pela urna (log, BU, RDV, vota).</p>
+          </div>
+          <div>
+            <h3>Log da urna (<code>.jez</code>)</h3>
+            <p>Diário técnico da máquina: ligou, modelo (UE2015/UE2020/UE2022…), carga, abertura, votação, emissão do BU. Não é o resultado de votos; é o rastro de eventos.</p>
+          </div>
+          <div>
+            <h3>BU — boletim de urna</h3>
+            <p>Resultado da seção (votos por cargo/candidato naquela urna). É o documento que a mesa imprime e que alimenta a totalização.</p>
+          </div>
+          <div>
+            <h3>RDV</h3>
+            <p>Registro Digital do Voto: sequência dos votos da seção (sem identificação do eleitor), usada em auditorias.</p>
+          </div>
+          <div>
+            <h3>VOTA (<code>.vsc</code>)</h3>
+            <p>Pacote de votação/assinaturas digital da urna, ligado à cadeia de integridade dos arquivos da seção.</p>
+          </div>
+        </div>
+        <p class="hint">O download foca nos <strong>logs</strong>. Votos oficiais de Presidente vêm do JSON de totalização do TSE; o filtro por modelo usa BUs parseados em <code>votos_secao</code>.</p>
+      </details>
+    </section>
+
+    <section class="tab-panel" id="presidente" role="tabpanel" aria-labelledby="tab-presidente" hidden>
+      <div class="panel-head">
+        <h2>Presidente</h2>
+        <p class="panel-sub">Votos nacionais e ranking — acompanham o filtro de modelo (pill no topo).</p>
+      </div>
+      <article class="card">
+        <div class="card-head">
+          <h3>Brasil</h3>
+          <div class="filter-bar">
+            <span class="pill" id="presStamp">—</span>
+          </div>
+        </div>
+        <div class="kpis compact" id="presKpis"></div>
+        <canvas id="chartPres"></canvas>
+      </article>
+      <article class="card">
+        <h3>Ranking</h3>
+        <div class="table-wrap">
+          <table class="sortable">
+            <thead>
+              <tr>
+                <th data-type="num">#</th>
+                <th data-type="num">Nº</th>
+                <th data-type="text">Candidato</th>
+                <th data-type="text">Partido</th>
+                <th data-type="num">Votos</th>
+                <th data-type="pct">%</th>
+              </tr>
+            </thead>
+            <tbody id="presBody"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <section class="tab-panel" id="modelos" role="tabpanel" aria-labelledby="tab-modelos" hidden>
+      <div class="panel-head">
+        <h2>Modelos de urna</h2>
+        <p class="panel-sub" id="geoSub">Clique em um modelo UE para filtrar votos, mapa, Detalhe por UF e municípios. A fatia “(faltando)” não aplica filtro.</p>
+      </div>
+      <article class="card">
+        <div class="card-head">
+          <h3>Votos válidos por modelo</h3>
+          <span class="pill muted-pill">clique para filtrar</span>
+        </div>
+        <div class="grid-2 tight modelos-split">
+          <div class="table-wrap short modelos-table">
+            <table class="sortable">
+              <thead>
+                <tr>
+                  <th data-type="text">Modelo</th>
+                  <th data-type="num">Votos</th>
+                  <th data-type="pct">PL</th>
+                  <th data-type="pct">PT</th>
+                  <th data-type="pct">% BR</th>
+                </tr>
+              </thead>
+              <tbody id="modBody"></tbody>
+            </table>
+          </div>
+          <div class="chart-box">
+            <canvas id="chartModelos"></canvas>
+          </div>
+        </div>
+        <p class="hint" id="modHint"></p>
+      </article>
+
+      <div class="grid-map">
+        <article class="card map-card">
+          <div class="card-head">
+            <h3>Mapa por UF</h3>
+            <label class="metric">
+              métrica
+              <select id="mapMetric">
+                <option value="secoes">Seções</option>
+                <option value="cobertura_log">% logs baixados</option>
+                <option value="cobertura_aux">% aux baixado</option>
+                <option value="totalizada">Seções totalizadas</option>
+                <option value="lider_pct">% do líder (Presidente)</option>
+                <option value="votos_modelo">Votos (modelo filtrado)</option>
+              </select>
+            </label>
+          </div>
+          <div id="map"></div>
+          <p class="hint" id="mapHint">Clique em um estado para filtrar municípios. Exterior (ZZ) não entra no mapa.</p>
+        </article>
+        <article class="card">
+          <h3 id="chartUfsTitle">Seções por UF</h3>
+          <canvas id="chartUfs"></canvas>
+          <p class="hint" id="chartUfsHint"></p>
+        </article>
+      </div>
+      <article class="card">
+        <div class="card-head">
+          <h3 id="ufTableTitle">Detalhe por UF</h3>
+          <span class="pill filter-pill hidden" id="ufFilterPill"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="sortable">
+            <thead>
+              <tr>
+                <th data-type="text">UF</th>
+                <th data-type="text">Nome</th>
+                <th data-type="num">Municípios</th>
+                <th data-type="num">Seções</th>
+                <th data-type="num">Aux</th>
+                <th data-type="num">Totalizadas</th>
+                <th data-type="num">Logs ok</th>
+                <th data-type="bytes">Volume</th>
+                <th data-type="text">Líder Pres.</th>
+                <th data-type="pct">%</th>
+              </tr>
+            </thead>
+            <tbody id="ufBody"></tbody>
+          </table>
+        </div>
+      </article>
+      <article class="card">
+        <div class="card-head">
+          <h3 id="munTableTitle">Maiores municípios</h3>
+          <span id="munFilter" class="pill">Brasil</span>
+        </div>
+        <div class="table-wrap">
+          <table class="sortable">
+            <thead>
+              <tr>
+                <th data-type="text">UF</th>
+                <th data-type="text">Município</th>
+                <th data-type="num">Seções</th>
+                <th data-type="num">Logs</th>
+              </tr>
+            </thead>
+            <tbody id="munBody"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <section class="tab-panel" id="apuracao" role="tabpanel" aria-labelledby="tab-apuracao" hidden>
+      <div class="panel-head">
+        <h2>Apuração / técnicos</h2>
+        <p class="panel-sub">Status dos AUX, ritmo de apuração e tamanho dos logs.</p>
+      </div>
+      <div class="grid-3">
+        <article class="card">
+          <h3>Status aux (totalização)</h3>
+          <canvas id="chartAux"></canvas>
+        </article>
+        <article class="card">
+          <h3>Apuração por data</h3>
+          <canvas id="chartDatas"></canvas>
+        </article>
+        <article class="card">
+          <h3>Apuração por hora</h3>
+          <canvas id="chartHoras"></canvas>
+        </article>
+      </div>
+      <article class="card">
+        <h3>Tamanho dos logs (.jez)</h3>
+        <canvas id="chartTam"></canvas>
+        <p class="hint" id="tamHint"></p>
+      </article>
+    </section>
+  </main>
+
+  <footer>
+    Dados públicos do portal Resultados TSE e Dados Abertos. Use <strong>Atualizar painel</strong> para refrescar os números.
+  </footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>
