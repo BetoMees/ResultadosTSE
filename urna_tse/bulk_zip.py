@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any, Callable, Optional
 
 import requests
 
+from .api import rate_limit_wait_seconds
 from .db import Database
 from .elections import UF_NAMES, bulk_zip_url, default_ufs, get_election
 
@@ -54,6 +56,8 @@ class BulkZipImporter:
         timeout: float = 600.0,
         progress_cb: Optional[Callable[[dict[str, Any]], None]] = None,
         election_id: Optional[str] = None,
+        max_retries: int = 8,
+        user_agent: str = "UrnaTSE-Downloader/1.0 (+pesquisa; dados publicos)",
     ) -> None:
         self.db = db
         self.year = int(year)
@@ -65,6 +69,8 @@ class BulkZipImporter:
         self.timeout = timeout
         self.progress_cb = progress_cb
         self.election_id = election_id or f"{year}-{turno}t"
+        self.max_retries = max(1, int(max_retries))
+        self.user_agent = user_agent
         self._cancel = False
 
     def cancel(self) -> None:
@@ -84,32 +90,78 @@ class BulkZipImporter:
             return path
         url = bulk_zip_url(self.year, self.turno, uf)
         self._emit(phase="download", uf=uf, url=url)
-        with requests.get(
-            url,
-            stream=True,
-            timeout=self.timeout,
-            headers={"User-Agent": "UrnaTSE-Downloader/1.0 (+pesquisa; dados publicos)"},
-        ) as resp:
-            if resp.status_code == 404:
-                raise FileNotFoundError(f"ZIP indisponível (HTTP 404): {url}")
-            if resp.status_code == 429:
-                raise RuntimeError(f"Rate limit (HTTP 429) em {url}")
-            resp.raise_for_status()
-            tmp = path.with_suffix(".partial")
-            total = 0
-            with open(tmp, "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    if self._cancel:
-                        raise RuntimeError("cancelado")
-                    if not chunk:
+        last_err: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            if self._cancel:
+                raise RuntimeError("cancelado")
+            try:
+                with requests.get(
+                    url,
+                    stream=True,
+                    timeout=self.timeout,
+                    headers={"User-Agent": self.user_agent},
+                ) as resp:
+                    if resp.status_code == 404:
+                        raise FileNotFoundError(f"ZIP indisponível (HTTP 404): {url}")
+                    if resp.status_code in (429, 500, 502, 503, 504):
+                        wait = rate_limit_wait_seconds(attempt, resp=resp)
+                        log.warning(
+                            "HTTP %s ao baixar ZIP %s (tentativa %s/%s); aguardando %.0fs",
+                            resp.status_code,
+                            uf.upper(),
+                            attempt,
+                            self.max_retries,
+                            wait,
+                        )
+                        self._emit(
+                            phase="rate_limit",
+                            uf=uf,
+                            status=resp.status_code,
+                            wait_s=wait,
+                            attempt=attempt,
+                        )
+                        time.sleep(wait)
                         continue
-                    fh.write(chunk)
-                    total += len(chunk)
-                    if total and total % (8 * 1024 * 1024) == 0:
-                        self._emit(phase="download", uf=uf, bytes=total)
-            tmp.replace(path)
-        self._emit(phase="downloaded", uf=uf, path=str(path), bytes=path.stat().st_size)
-        return path
+                    resp.raise_for_status()
+                    tmp = path.with_suffix(".partial")
+                    total = 0
+                    with open(tmp, "wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                            if self._cancel:
+                                raise RuntimeError("cancelado")
+                            if not chunk:
+                                continue
+                            fh.write(chunk)
+                            total += len(chunk)
+                            if total and total % (8 * 1024 * 1024) == 0:
+                                self._emit(phase="download", uf=uf, bytes=total)
+                    tmp.replace(path)
+                self._emit(phase="downloaded", uf=uf, path=str(path), bytes=path.stat().st_size)
+                return path
+            except FileNotFoundError:
+                raise
+            except RuntimeError:
+                raise
+            except requests.RequestException as exc:
+                last_err = exc
+                wait = rate_limit_wait_seconds(attempt, resp=getattr(exc, "response", None))
+                log.warning(
+                    "Falha de rede no ZIP %s (tentativa %s/%s): %s; aguardando %.0fs",
+                    uf.upper(),
+                    attempt,
+                    self.max_retries,
+                    exc,
+                    wait,
+                )
+                self._emit(
+                    phase="rate_limit",
+                    uf=uf,
+                    error=str(exc),
+                    wait_s=wait,
+                    attempt=attempt,
+                )
+                time.sleep(wait)
+        raise RuntimeError(f"Rate limit / falha ao baixar {url}: {last_err}")
 
     def import_zip(self, uf: str, zip_path: Path) -> dict[str, int]:
         uf = uf.lower()

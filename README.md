@@ -76,9 +76,19 @@ Get-Content data\download.err.log -Tail 30
 ### Rate limit (429)
 
 A CDN do TSE pode bloquear temporariamente se o volume de requests for alto
-(~1 `aux` + 1 arquivo por seção; centenas de milhares no país). Reduza
-`--workers` e aumente `--min-interval` (ex.: `0.1`–`0.25`) e espere o bloqueio
-passar.
+(~1 `aux` + 1 arquivo por seção; centenas de milhares no país).
+
+O cliente HTTP já trata isso:
+
+- **HTTP 429 / 5xx**: espera longa antes de retentar (honra `Retry-After` se existir;
+  senão backoff 30s → 60s → 120s… até 10 min), e aumenta o `min_interval`.
+- **Download ZIP (2022)**: mesma lógica ao baixar cada UF; o painel mostra
+  “rate limit / espera Ns”.
+- Se o bloqueio persistir após várias tentativas, a UF/arquivo falha e o job
+  pode ser **Continuado** depois.
+
+Ainda assim, reduza `--workers` e aumente `--min-interval` (ex.: `0.1`–`0.25`)
+se notar muitos 429.
 
 Não existe endpoint “baixar tudo de uma vez” no portal Resultados. Pacotes ZIP
 por UF (*Arquivos transmitidos para totalização*) costumam aparecer depois no

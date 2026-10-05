@@ -473,6 +473,14 @@ class DownloadJobManager:
         if phase == "download":
             b = info.get("bytes")
             return f"{election_id}: baixando ZIP {uf}" + (f" ({b} bytes)" if b else "")
+        if phase == "rate_limit":
+            wait = float(info.get("wait_s") or 0)
+            attempt = info.get("attempt")
+            return (
+                f"{election_id}: rate limit / espera "
+                f"{wait:.0f}s antes de retentar {uf}"
+                + (f" ({attempt})" if attempt else "")
+            )
         if phase == "import":
             done = info.get("done")
             total = info.get("total")

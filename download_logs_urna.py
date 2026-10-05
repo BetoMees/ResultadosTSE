@@ -44,7 +44,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.02,
         help="Intervalo mínimo entre *inícios* de request (s; default: 0.02)",
     )
-    p.add_argument("--max-retries", type=int, default=5)
+    p.add_argument("--max-retries", type=int, default=8, help="Tentativas por request (default: 8; 429 espera mais)")
     p.add_argument("--limit", type=int, help="Limite total de itens (útil para teste)")
     p.add_argument(
         "--batch-size",

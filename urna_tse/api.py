@@ -13,6 +13,33 @@ import requests
 log = logging.getLogger(__name__)
 
 
+def parse_retry_after(resp: Optional[requests.Response]) -> Optional[float]:
+    """Lê Retry-After (segundos). Ignora formato HTTP-date."""
+    if resp is None:
+        return None
+    raw = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return max(1.0, float(str(raw).strip()))
+    except ValueError:
+        return None
+
+
+def rate_limit_wait_seconds(
+    attempt: int,
+    *,
+    resp: Optional[requests.Response] = None,
+    base: float = 30.0,
+    cap: float = 600.0,
+) -> float:
+    """Espera para 429/bloqueio: Retry-After ou backoff exponencial longo (30s, 60s, …)."""
+    hinted = parse_retry_after(resp)
+    if hinted is not None:
+        return min(cap, hinted)
+    return min(cap, base * (2 ** max(0, attempt - 1)))
+
+
 def json_loads(raw: bytes) -> Any:
     return json.loads(raw.decode("utf-8"))
 
@@ -60,7 +87,7 @@ class TseResultadosClient:
         host: str = DEFAULT_HOST,
         ambiente: str = DEFAULT_AMBIENTE,
         timeout: float = 60.0,
-        max_retries: int = 5,
+        max_retries: int = 8,
         backoff: float = 1.5,
         min_interval: float = 0.05,
         user_agent: str = "UrnaTSE-Downloader/1.0 (+pesquisa; dados publicos)",
@@ -114,6 +141,7 @@ class TseResultadosClient:
         last_err: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
             self._throttle()
+            resp: Optional[requests.Response] = None
             try:
                 resp = self._session().get(url, timeout=self.timeout)
                 if resp.status_code == 404 and allow_404:
@@ -124,8 +152,37 @@ class TseResultadosClient:
                 return resp.status_code, resp.content, url
             except (requests.RequestException, requests.HTTPError) as exc:
                 last_err = exc
-                sleep_s = self.backoff ** (attempt - 1)
-                log.warning("Falha %s/%s em %s: %s; retry em %.1fs", attempt, self.max_retries, url, exc, sleep_s)
+                status = None
+                if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                    status = exc.response.status_code
+                    resp = exc.response
+                elif resp is not None:
+                    status = resp.status_code
+
+                if status == 429:
+                    # Bloqueio da CDN: espera longa + reduz ritmo dos próximos requests.
+                    sleep_s = rate_limit_wait_seconds(attempt, resp=resp)
+                    with self._lock:
+                        self.min_interval = max(self.min_interval, min(1.0, self.min_interval * 2 or 0.2))
+                    log.warning(
+                        "Rate limit HTTP 429 em %s (tentativa %s/%s); aguardando %.0fs "
+                        "(min_interval agora %.2fs)",
+                        url,
+                        attempt,
+                        self.max_retries,
+                        sleep_s,
+                        self.min_interval,
+                    )
+                else:
+                    sleep_s = self.backoff ** (attempt - 1)
+                    log.warning(
+                        "Falha %s/%s em %s: %s; retry em %.1fs",
+                        attempt,
+                        self.max_retries,
+                        url,
+                        exc,
+                        sleep_s,
+                    )
                 time.sleep(sleep_s)
         raise RuntimeError(f"Falha ao baixar {url}: {last_err}")
 
