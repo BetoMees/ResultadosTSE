@@ -63,14 +63,6 @@ def cached(ttl: float = TTL):
     def deco(fn: Callable):
         @wraps(fn)
         def inner(*args, **kwargs):
-            # Durante download, não servir cache — KPIs/cobertura mudam a cada commit no SQLite.
-            try:
-                job = JOBS.status()
-                downloading = job.get("status") in ("running", "starting", "stopping")
-            except Exception:  # noqa: BLE001
-                downloading = False
-            if downloading:
-                return fn(*args, **kwargs)
             # Inclui o DB ativo na chave — senão "Ver no painel" reaproveita cache da eleição anterior.
             key = (
                 fn.__name__
@@ -81,8 +73,16 @@ def cached(ttl: float = TTL):
                 + repr(sorted(kwargs.items()))
             )
             now = time.time()
+            # Durante download, TTL curto (painel_stats é leve) — evita avalanche
+            # de COUNT/JOIN no SQLite enquanto o writer grava BLOBs.
+            try:
+                job = JOBS.status()
+                downloading = job.get("status") in ("running", "starting", "stopping")
+            except Exception:  # noqa: BLE001
+                downloading = False
+            use_ttl = 3.0 if downloading else ttl
             hit = _cache.get(key)
-            if hit and now - hit[0] < ttl:
+            if hit and now - hit[0] < use_ttl:
                 return hit[1]
             value = fn(*args, **kwargs)
             _cache[key] = (now, value)
@@ -209,6 +209,7 @@ def api_overview():
 
 
 @app.get("/api/elections")
+@cached(ttl=5.0)
 def api_elections():
     active = db_path().name
     job = JOBS.status()
@@ -220,41 +221,28 @@ def api_elections():
     items = []
     for e in list_elections():
         db_file = DATA / e["db_filename"]
-        logs_ok = 0
-        secoes = 0
-        if db_file.exists():
-            try:
-                with connect(db_file) as conn:
-                    logs_ok = int(
-                        conn.execute(
-                            "SELECT COUNT(*) FROM arquivos WHERE tipo='log' AND status='ok'"
-                        ).fetchone()[0]
-                        or 0
-                    )
-                    secoes = int(conn.execute("SELECT COUNT(*) FROM secoes").fetchone()[0] or 0)
-            except Exception:  # noqa: BLE001
-                logs_ok = 0
-                secoes = 0
+        # Cobertura vem de painel_stats (leve). Sem COUNT em arquivos/BLOB.
+        cov = (
+            election_coverage(e)
+            if db_file.exists()
+            else {
+                "ufs_expected": len(default_ufs()),
+                "ufs_done": 0,
+                "ufs_missing": list(default_ufs()),
+                "logs_ok": 0,
+                "secoes": 0,
+                "partial": False,
+                "complete": False,
+            }
+        )
+        logs_ok = int(cov.get("logs_ok") or 0)
+        secoes = int(cov.get("secoes") or 0)
         downloading = busy_election == e["id"]
         has_data = logs_ok > 0 or secoes > 0
         can_download = (
             e["mode"] == "regional"
             or (e["mode"] == "bulk_zip" and e.get("bulk_available", False))
         )
-        cov = election_coverage(e) if has_data or db_file.exists() else {
-            "ufs_expected": len(default_ufs()),
-            "ufs_done": 0,
-            "ufs_missing": list(default_ufs()),
-            "logs_ok": 0,
-            "secoes": 0,
-            "partial": False,
-            "complete": False,
-        }
-        # Preferir contagens frescas do DB aberto acima quando disponíveis
-        if logs_ok:
-            cov["logs_ok"] = logs_ok
-        if secoes:
-            cov["secoes"] = secoes
         partial = bool(cov.get("partial")) or (
             has_data and not cov.get("complete") and bool(cov.get("ufs_missing"))
         )
@@ -273,13 +261,9 @@ def api_elections():
                 "ufs_expected": cov.get("ufs_expected"),
                 "ufs_done": cov.get("ufs_done"),
                 "ufs_missing": cov.get("ufs_missing") or [],
-                # Iniciar só se ainda não há dados e nada está baixando.
                 "can_start": can_download and not has_data and busy_election is None,
-                # Continuar quando parou no meio (faltam UFs / logs).
                 "can_continue": can_download and incomplete and busy_election is None,
-                # Remover: não apagar enquanto esta eleição está baixando.
                 "can_remove": has_data and not downloading,
-                # Pode ver no painel com dados parciais, mesmo com download em curso.
                 "can_view": has_data,
                 "can_download": can_download,
             }
@@ -297,14 +281,9 @@ def api_select_election(body: SelectDbBody):
     if not path.exists():
         raise HTTPException(409, "Download ainda não iniciado para esta eleição.")
     try:
-        with connect(path) as conn:
-            logs_ok = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM arquivos WHERE tipo='log' AND status='ok'"
-                ).fetchone()[0]
-                or 0
-            )
-            secoes = int(conn.execute("SELECT COUNT(*) FROM secoes").fetchone()[0] or 0)
+        cov = election_coverage(election)
+        logs_ok = int(cov.get("logs_ok") or 0)
+        secoes = int(cov.get("secoes") or 0)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(409, f"Banco indisponível: {exc}") from exc
     if logs_ok <= 0 and secoes <= 0:

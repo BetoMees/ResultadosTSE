@@ -822,38 +822,46 @@ function initTabs() {
   }
 }
 
+let refreshInFlight = null;
+
 async function refresh() {
-  const ufsUrl = selectedModelo
-    ? `/api/ufs?modelo=${encodeURIComponent(selectedModelo)}`
-    : "/api/ufs";
-  const [ov, ufs, aux, apu, tam, mod, pres, elections] = await Promise.all([
-    j("/api/overview"),
-    j(ufsUrl),
-    j("/api/aux-status"),
-    j("/api/apuracao"),
-    j("/api/tamanhos"),
-    j("/api/modelos"),
-    j("/api/presidente"),
-    j("/api/elections").catch((err) => {
-      console.warn("elections", err);
-      return { elections: [], active_db: null, job: { status: "idle", message: "API de eleições indisponível — reinicie o dashboard" } };
-    }),
-  ]);
-  ufIndex = Object.fromEntries(ufs.ufs.map((r) => [r.uf, r]));
-  lastUfRows = ufs.ufs;
-  lastPresNational = pres;
-  renderKpis(ov);
-  renderElections(elections);
-  if (selectedModelo) {
-    await loadPresidenteForFilter();
-  } else {
-    renderPresidente(pres);
-  }
-  renderModelos(mod);
-  renderUfTable(lastUfRows);
-  renderCharts(lastUfRows, aux, apu, tam);
-  paintMap();
-  await renderMunicipios();
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = (async () => {
+    const ufsUrl = selectedModelo
+      ? `/api/ufs?modelo=${encodeURIComponent(selectedModelo)}`
+      : "/api/ufs";
+    const [ov, ufs, aux, apu, tam, mod, pres, elections] = await Promise.all([
+      j("/api/overview"),
+      j(ufsUrl),
+      j("/api/aux-status"),
+      j("/api/apuracao"),
+      j("/api/tamanhos"),
+      j("/api/modelos"),
+      j("/api/presidente"),
+      j("/api/elections").catch((err) => {
+        console.warn("elections", err);
+        return { elections: [], active_db: null, job: { status: "idle", message: "API de eleições indisponível — reinicie o dashboard" } };
+      }),
+    ]);
+    ufIndex = Object.fromEntries(ufs.ufs.map((r) => [r.uf, r]));
+    lastUfRows = ufs.ufs;
+    lastPresNational = pres;
+    renderKpis(ov);
+    renderElections(elections);
+    if (selectedModelo) {
+      await loadPresidenteForFilter();
+    } else {
+      renderPresidente(pres);
+    }
+    renderModelos(mod);
+    renderUfTable(lastUfRows);
+    renderCharts(lastUfRows, aux, apu, tam);
+    paintMap();
+    await renderMunicipios();
+  })().finally(() => {
+    refreshInFlight = null;
+  });
+  return refreshInFlight;
 }
 
 function modeLabel(e) {
@@ -1065,6 +1073,7 @@ function pollJob() {
   jobPollTicks = 0;
   jobPollTimer = setInterval(async () => {
     try {
+      // Só status leve — não dispara /api/elections em paralelo.
       const job = await j("/api/downloads/status");
       const busy = ["running", "starting", "stopping"].includes(job.status);
       const line = document.getElementById("downloadJobLine");
@@ -1083,9 +1092,9 @@ function pollJob() {
         await refresh();
         return;
       }
-      // A cada ~9s atualiza cards/KPIs enquanto o SQLite recebe logs.
+      // A cada ~12s atualiza o painel, mas só se o refresh anterior já terminou.
       jobPollTicks += 1;
-      if (jobPollTicks % 3 === 0) {
+      if (jobPollTicks % 4 === 0 && !refreshInFlight) {
         await refresh();
       }
     } catch (_) {

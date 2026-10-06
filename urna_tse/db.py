@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -139,6 +141,37 @@ CREATE INDEX IF NOT EXISTS idx_arquivos_secao ON arquivos(secao_id);
 CREATE INDEX IF NOT EXISTS idx_votos_cand_abr ON votos_candidatos(abr);
 CREATE INDEX IF NOT EXISTS idx_votos_secao_modelo ON votos_secao(modelo_urna);
 CREATE INDEX IF NOT EXISTS idx_votos_secao_cand_num ON votos_secao_cand(numero);
+
+-- Resumo para o painel: nunca precisa varrer arquivos.content (BLOB).
+CREATE TABLE IF NOT EXISTS painel_stats (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    secoes INTEGER NOT NULL DEFAULT 0,
+    logs_ok INTEGER NOT NULL DEFAULT 0,
+    logs_pending INTEGER NOT NULL DEFAULT 0,
+    aux_ok INTEGER NOT NULL DEFAULT 0,
+    aux_total INTEGER NOT NULL DEFAULT 0,
+    cargas INTEGER NOT NULL DEFAULT 0,
+    bytes_ok INTEGER NOT NULL DEFAULT 0,
+    municipios INTEGER NOT NULL DEFAULT 0,
+    ufs INTEGER NOT NULL DEFAULT 0,
+    ufs_done INTEGER NOT NULL DEFAULT 0,
+    ufs_expected INTEGER NOT NULL DEFAULT 0,
+    ufs_missing TEXT,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS painel_uf (
+    uf TEXT PRIMARY KEY,
+    n_secoes INTEGER NOT NULL DEFAULT 0,
+    logs_ok INTEGER NOT NULL DEFAULT 0,
+    aux_ok INTEGER NOT NULL DEFAULT 0,
+    bytes_ok INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS painel_modelo (
+    modelo TEXT PRIMARY KEY,
+    n_secoes INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -219,11 +252,310 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_votos_cand_abr ON votos_candidatos(abr);
             CREATE INDEX IF NOT EXISTS idx_votos_secao_modelo ON votos_secao(modelo_urna);
             CREATE INDEX IF NOT EXISTS idx_votos_secao_cand_num ON votos_secao_cand(numero);
+
+            CREATE TABLE IF NOT EXISTS painel_stats (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                secoes INTEGER NOT NULL DEFAULT 0,
+                logs_ok INTEGER NOT NULL DEFAULT 0,
+                logs_pending INTEGER NOT NULL DEFAULT 0,
+                aux_ok INTEGER NOT NULL DEFAULT 0,
+                aux_total INTEGER NOT NULL DEFAULT 0,
+                cargas INTEGER NOT NULL DEFAULT 0,
+                bytes_ok INTEGER NOT NULL DEFAULT 0,
+                municipios INTEGER NOT NULL DEFAULT 0,
+                ufs INTEGER NOT NULL DEFAULT 0,
+                ufs_done INTEGER NOT NULL DEFAULT 0,
+                ufs_expected INTEGER NOT NULL DEFAULT 0,
+                ufs_missing TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS painel_uf (
+                uf TEXT PRIMARY KEY,
+                n_secoes INTEGER NOT NULL DEFAULT 0,
+                logs_ok INTEGER NOT NULL DEFAULT 0,
+                aux_ok INTEGER NOT NULL DEFAULT 0,
+                bytes_ok INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS painel_modelo (
+                modelo TEXT PRIMARY KEY,
+                n_secoes INTEGER NOT NULL DEFAULT 0
+            );
             """
         )
+        # Bancos antigos: monta o resumo uma vez (só secoes/aux — sem varrer BLOB).
+        row = self.conn.execute("SELECT updated_at FROM painel_stats WHERE id=1").fetchone()
+        if row is None:
+            try:
+                self.rebuild_painel_stats(commit=False)
+            except Exception:
+                pass
 
     def close(self) -> None:
         self.conn.close()
+
+    def rebuild_painel_stats(
+        self,
+        *,
+        expected_ufs: Optional[list[str]] = None,
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        """Agrega KPIs/cobertura a partir de secoes/aux — sem JOIN em arquivos.content."""
+        now = datetime.now(timezone.utc).isoformat()
+        uf_rows = list(
+            self.conn.execute(
+                """
+                SELECT uf,
+                       COUNT(*) AS n_secoes,
+                       SUM(
+                         CASE WHEN modelo_urna IS NOT NULL AND TRIM(modelo_urna) != ''
+                         THEN 1 ELSE 0 END
+                       ) AS logs_ok
+                FROM secoes
+                GROUP BY uf
+                """
+            )
+        )
+        aux_by_uf = {
+            str(r["uf"]).lower(): int(r["c"] or 0)
+            for r in self.conn.execute(
+                """
+                SELECT s.uf, COUNT(*) AS c
+                FROM aux a
+                JOIN secoes s ON s.id = a.secao_id
+                WHERE a.http_status = 200
+                GROUP BY s.uf
+                """
+            )
+        }
+        modelo_rows = list(
+            self.conn.execute(
+                """
+                SELECT COALESCE(NULLIF(TRIM(modelo_urna), ''), '(não identificado)') AS modelo,
+                       COUNT(*) AS n_secoes
+                FROM secoes
+                WHERE modelo_urna IS NOT NULL AND TRIM(modelo_urna) != ''
+                GROUP BY 1
+                """
+            )
+        )
+        municipios = int(
+            self.conn.execute(
+                "SELECT COUNT(DISTINCT uf || '-' || municipio_cd) FROM secoes"
+            ).fetchone()[0]
+            or 0
+        )
+        aux_ok = int(
+            self.conn.execute("SELECT COUNT(*) FROM aux WHERE http_status=200").fetchone()[0]
+            or 0
+        )
+        aux_total = int(self.conn.execute("SELECT COUNT(*) FROM aux").fetchone()[0] or 0)
+        cargas = int(self.conn.execute("SELECT COUNT(*) FROM cargas").fetchone()[0] or 0)
+        # bytes: mantém valor anterior se já houver (evitar SUM em tabela com BLOB).
+        prev = self.conn.execute(
+            "SELECT bytes_ok FROM painel_stats WHERE id=1"
+        ).fetchone()
+        bytes_ok = int(prev["bytes_ok"] or 0) if prev else 0
+
+        self.conn.execute("DELETE FROM painel_uf")
+        self.conn.execute("DELETE FROM painel_modelo")
+        secoes = 0
+        logs_ok = 0
+        for r in uf_rows:
+            uf = str(r["uf"]).lower()
+            n_sec = int(r["n_secoes"] or 0)
+            n_log = int(r["logs_ok"] or 0)
+            secoes += n_sec
+            logs_ok += n_log
+            self.conn.execute(
+                """
+                INSERT INTO painel_uf(uf, n_secoes, logs_ok, aux_ok, bytes_ok)
+                VALUES(?,?,?,?,0)
+                """,
+                (uf, n_sec, n_log, int(aux_by_uf.get(uf, 0))),
+            )
+        for r in modelo_rows:
+            self.conn.execute(
+                "INSERT INTO painel_modelo(modelo, n_secoes) VALUES(?,?)",
+                (r["modelo"], int(r["n_secoes"] or 0)),
+            )
+
+        expected = [u.lower() for u in (expected_ufs or [])]
+        if not expected:
+            expected = sorted({str(r["uf"]).lower() for r in uf_rows})
+        by_uf = {
+            str(r["uf"]).lower(): (int(r["n_secoes"] or 0), int(r["logs_ok"] or 0))
+            for r in uf_rows
+        }
+        missing: list[str] = []
+        ufs_done = 0
+        for uf in expected:
+            n_sec, n_log = by_uf.get(uf, (0, 0))
+            if n_sec <= 0 or n_log < n_sec:
+                missing.append(uf)
+            else:
+                ufs_done += 1
+        for uf in by_uf:
+            if uf not in expected and uf not in missing:
+                n_sec, n_log = by_uf[uf]
+                if n_sec <= 0 or n_log < n_sec:
+                    missing.append(uf)
+                else:
+                    ufs_done += 1
+
+        payload = {
+            "secoes": secoes,
+            "logs_ok": logs_ok,
+            "logs_pending": max(0, secoes - logs_ok),
+            "aux_ok": aux_ok,
+            "aux_total": aux_total,
+            "cargas": cargas,
+            "bytes_ok": bytes_ok,
+            "municipios": municipios,
+            "ufs": len(by_uf),
+            "ufs_done": ufs_done,
+            "ufs_expected": max(len(expected), len(by_uf)),
+            "ufs_missing": missing,
+            "updated_at": now,
+        }
+        self.conn.execute(
+            """
+            INSERT INTO painel_stats(
+                id, secoes, logs_ok, logs_pending, aux_ok, aux_total, cargas,
+                bytes_ok, municipios, ufs, ufs_done, ufs_expected, ufs_missing, updated_at
+            ) VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+                secoes=excluded.secoes,
+                logs_ok=excluded.logs_ok,
+                logs_pending=excluded.logs_pending,
+                aux_ok=excluded.aux_ok,
+                aux_total=excluded.aux_total,
+                cargas=excluded.cargas,
+                bytes_ok=excluded.bytes_ok,
+                municipios=excluded.municipios,
+                ufs=excluded.ufs,
+                ufs_done=excluded.ufs_done,
+                ufs_expected=excluded.ufs_expected,
+                ufs_missing=excluded.ufs_missing,
+                updated_at=excluded.updated_at
+            """,
+            (
+                payload["secoes"],
+                payload["logs_ok"],
+                payload["logs_pending"],
+                payload["aux_ok"],
+                payload["aux_total"],
+                payload["cargas"],
+                payload["bytes_ok"],
+                payload["municipios"],
+                payload["ufs"],
+                payload["ufs_done"],
+                payload["ufs_expected"],
+                json.dumps(payload["ufs_missing"], ensure_ascii=False),
+                payload["updated_at"],
+            ),
+        )
+        if commit:
+            self.conn.commit()
+        # Espelho JSON para o painel ler sem competir com o writer do SQLite.
+        try:
+            mirror = self.path.with_suffix(self.path.suffix + ".painel.json")
+            mirror.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        return payload
+
+    def bump_painel_log_ok(self, *, uf: str, modelo: Optional[str], size_bytes: int = 0) -> None:
+        """Incrementa contadores após um log gravado com sucesso (sem rebuild completo)."""
+        uf = (uf or "").lower()
+        if not uf:
+            return
+        self.conn.execute(
+            """
+            INSERT INTO painel_stats(
+                id, secoes, logs_ok, logs_pending, aux_ok, aux_total, cargas,
+                bytes_ok, municipios, ufs, ufs_done, ufs_expected, ufs_missing, updated_at
+            ) VALUES(1,0,1,0,0,0,0,?,0,0,0,0,'[]',?)
+            ON CONFLICT(id) DO UPDATE SET
+                logs_ok = logs_ok + 1,
+                logs_pending = CASE WHEN logs_pending > 0 THEN logs_pending - 1 ELSE 0 END,
+                bytes_ok = bytes_ok + excluded.bytes_ok,
+                updated_at = excluded.updated_at
+            """,
+            (
+                max(0, int(size_bytes or 0)),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO painel_uf(uf, n_secoes, logs_ok, aux_ok, bytes_ok)
+            VALUES(?,0,1,0,?)
+            ON CONFLICT(uf) DO UPDATE SET
+                logs_ok = logs_ok + 1,
+                bytes_ok = bytes_ok + excluded.bytes_ok
+            """,
+            (uf, max(0, int(size_bytes or 0))),
+        )
+        if modelo:
+            self.conn.execute(
+                """
+                INSERT INTO painel_modelo(modelo, n_secoes) VALUES(?,1)
+                ON CONFLICT(modelo) DO UPDATE SET n_secoes = n_secoes + 1
+                """,
+                (modelo,),
+            )
+
+    def read_painel_stats(self) -> Optional[dict[str, Any]]:
+        row = self.conn.execute("SELECT * FROM painel_stats WHERE id=1").fetchone()
+        if not row:
+            return None
+        missing_raw = row["ufs_missing"] or "[]"
+        try:
+            missing = json.loads(missing_raw)
+            if not isinstance(missing, list):
+                missing = []
+        except Exception:
+            missing = []
+        return {
+            "secoes": int(row["secoes"] or 0),
+            "logs_ok": int(row["logs_ok"] or 0),
+            "logs_pending": int(row["logs_pending"] or 0),
+            "aux_ok": int(row["aux_ok"] or 0),
+            "aux_total": int(row["aux_total"] or 0),
+            "cargas": int(row["cargas"] or 0),
+            "bytes_ok": int(row["bytes_ok"] or 0),
+            "municipios": int(row["municipios"] or 0),
+            "ufs": int(row["ufs"] or 0),
+            "ufs_done": int(row["ufs_done"] or 0),
+            "ufs_expected": int(row["ufs_expected"] or 0),
+            "ufs_missing": [str(u).lower() for u in missing],
+            "updated_at": row["updated_at"],
+        }
+
+    def read_painel_ufs(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "uf": str(r["uf"]).lower(),
+                "n_secoes": int(r["n_secoes"] or 0),
+                "logs_ok": int(r["logs_ok"] or 0),
+                "aux_ok": int(r["aux_ok"] or 0),
+                "bytes_ok": int(r["bytes_ok"] or 0),
+            }
+            for r in self.conn.execute(
+                "SELECT uf, n_secoes, logs_ok, aux_ok, bytes_ok FROM painel_uf ORDER BY logs_ok DESC"
+            )
+        ]
+
+    def read_painel_modelos(self) -> list[dict[str, Any]]:
+        return [
+            {"modelo": r["modelo"], "n_secoes": int(r["n_secoes"] or 0)}
+            for r in self.conn.execute(
+                "SELECT modelo, n_secoes FROM painel_modelo ORDER BY n_secoes DESC, modelo"
+            )
+        ]
 
     def set_meta(self, key: str, value: Any) -> None:
         self.conn.execute(
@@ -353,6 +685,62 @@ class Database:
             sql += f" AND s.uf IN ({placeholders})"
             params.extend(ufs)
         sql += " ORDER BY s.uf, s.municipio_cd, s.zona, s.secao"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        return list(self.conn.execute(sql, params))
+
+    def pending_bus(self, ufs: Optional[list[str]] = None, limit: Optional[int] = None) -> list[sqlite3.Row]:
+        """BUs pendentes; prioriza seções que já têm log/modelo (para votos por modelo)."""
+        sql = """
+            SELECT
+                a.id AS arquivo_id,
+                a.nome,
+                a.tipo,
+                a.status,
+                c.hash,
+                s.id AS secao_id,
+                s.uf,
+                s.municipio_cd,
+                s.zona,
+                s.secao,
+                COALESCE(
+                    NULLIF(s.modelo_urna, ''),
+                    (
+                        SELECT l.modelo_urna FROM arquivos l
+                        WHERE l.secao_id = s.id AND l.tipo = 'log' AND l.status = 'ok'
+                          AND l.modelo_urna IS NOT NULL AND TRIM(l.modelo_urna) != ''
+                        LIMIT 1
+                    )
+                ) AS modelo_urna
+            FROM arquivos a
+            JOIN cargas c ON c.id = a.carga_id
+            JOIN secoes s ON s.id = a.secao_id
+            WHERE a.tipo = 'bu'
+              AND a.status != 'ok'
+              AND NOT EXISTS (
+                  SELECT 1 FROM votos_secao v
+                  WHERE v.secao_id = a.secao_id AND v.status IN ('ok', 'empty')
+              )
+        """
+        params: list[Any] = []
+        if ufs:
+            placeholders = ",".join("?" for _ in ufs)
+            sql += f" AND s.uf IN ({placeholders})"
+            params.extend(ufs)
+        # Prioriza seções com modelo já identificado (log ok).
+        sql += """
+            ORDER BY
+              CASE WHEN COALESCE(
+                    NULLIF(s.modelo_urna, ''),
+                    (
+                        SELECT l.modelo_urna FROM arquivos l
+                        WHERE l.secao_id = s.id AND l.tipo = 'log' AND l.status = 'ok'
+                          AND l.modelo_urna IS NOT NULL AND TRIM(l.modelo_urna) != ''
+                        LIMIT 1
+                    )
+                  ) LIKE 'UE%' THEN 0 ELSE 1 END,
+              s.uf, s.municipio_cd, s.zona, s.secao
+        """
         if limit:
             sql += f" LIMIT {int(limit)}"
         return list(self.conn.execute(sql, params))
@@ -518,6 +906,18 @@ class Database:
         error: Optional[str] = None,
         downloaded_at: Optional[str] = None,
     ) -> None:
+        prev = self.conn.execute(
+            """
+            SELECT a.status, a.tipo, s.uf
+            FROM arquivos a
+            JOIN secoes s ON s.id = a.secao_id
+            WHERE a.id = ?
+            """,
+            (arquivo_id,),
+        ).fetchone()
+        prev_status = prev["status"] if prev else None
+        prev_tipo = prev["tipo"] if prev else None
+        prev_uf = str(prev["uf"] or "").lower() if prev else ""
         self.conn.execute(
             """
             UPDATE arquivos SET
@@ -553,6 +953,12 @@ class Database:
                 WHERE id = (SELECT secao_id FROM arquivos WHERE id = ?)
                 """,
                 (modelo_urna, arquivo_id),
+            )
+        if status == "ok" and prev_status != "ok" and prev_tipo == "log" and prev_uf:
+            self.bump_painel_log_ok(
+                uf=prev_uf,
+                modelo=modelo_urna,
+                size_bytes=int(size_bytes or 0),
             )
 
     def upsert_votos_presidente(
@@ -690,6 +1096,18 @@ class Database:
         self.conn.commit()
 
     def stats(self) -> dict[str, int]:
+        painel = self.read_painel_stats()
+        if painel:
+            return {
+                "ufs": int(painel["ufs"]),
+                "secoes": int(painel["secoes"]),
+                "aux_ok": int(painel["aux_ok"]),
+                "aux_total": int(painel["aux_total"]),
+                "cargas": int(painel["cargas"]),
+                "logs_ok": int(painel["logs_ok"]),
+                "logs_pending": int(painel["logs_pending"]),
+                "logs_total": int(painel["logs_ok"]) + int(painel["logs_pending"]),
+            }
         return {
             "ufs": self.count("uf_config"),
             "secoes": self.count("secoes"),

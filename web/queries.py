@@ -84,19 +84,52 @@ def _normalize_modelo(modelo: Optional[str]) -> Optional[str]:
 
 def overview(conn: sqlite3.Connection) -> dict[str, Any]:
     meta = {r["key"]: r["value"] for r in _rows(conn, "SELECT key, value FROM meta")}
-    logs_ok = int(_scalar(conn, "SELECT COUNT(*) FROM arquivos WHERE tipo='log' AND status='ok'") or 0)
-    logs_pending = int(_scalar(conn, "SELECT COUNT(*) FROM arquivos WHERE tipo='log' AND status!='ok'") or 0)
-    bytes_ok = int(_scalar(conn, "SELECT COALESCE(SUM(size_bytes),0) FROM arquivos WHERE tipo='log' AND status='ok'") or 0)
-    avg_bytes = float(_scalar(conn, "SELECT COALESCE(AVG(size_bytes),0) FROM arquivos WHERE tipo='log' AND status='ok'") or 0)
-    aux_ok = int(_scalar(conn, "SELECT COUNT(*) FROM aux WHERE http_status=200") or 0)
+    painel = None
+    try:
+        painel = conn.execute("SELECT * FROM painel_stats WHERE id=1").fetchone()
+    except sqlite3.OperationalError:
+        painel = None
+    if painel and (int(painel["secoes"] or 0) > 0 or int(painel["logs_ok"] or 0) > 0):
+        logs_ok = int(painel["logs_ok"] or 0)
+        logs_pending = int(painel["logs_pending"] or 0)
+        bytes_ok = int(painel["bytes_ok"] or 0)
+        aux_ok = int(painel["aux_ok"] or 0)
+        aux_total = int(painel["aux_total"] or 0)
+        cargas = int(painel["cargas"] or 0)
+        secoes = int(painel["secoes"] or 0)
+        municipios = int(painel["municipios"] or 0)
+        ufs_n = int(painel["ufs"] or 0)
+    else:
+        # Fallback sem varrer BLOB: proxy logs via secoes.modelo_urna.
+        logs_ok = int(
+            _scalar(
+                conn,
+                """
+                SELECT COUNT(*) FROM secoes
+                WHERE modelo_urna IS NOT NULL AND TRIM(modelo_urna) != ''
+                """,
+            )
+            or 0
+        )
+        secoes = int(_scalar(conn, "SELECT COUNT(*) FROM secoes") or 0)
+        logs_pending = max(0, secoes - logs_ok)
+        bytes_ok = 0
+        aux_ok = int(_scalar(conn, "SELECT COUNT(*) FROM aux WHERE http_status=200") or 0)
+        aux_total = int(_scalar(conn, "SELECT COUNT(*) FROM aux") or 0)
+        cargas = int(_scalar(conn, "SELECT COUNT(*) FROM cargas") or 0)
+        municipios = int(
+            _scalar(conn, "SELECT COUNT(DISTINCT uf || '-' || municipio_cd) FROM secoes") or 0
+        )
+        ufs_n = int(_scalar(conn, "SELECT COUNT(*) FROM uf_config") or 0)
+    avg_bytes = (bytes_ok / logs_ok) if logs_ok and bytes_ok else 0.0
     return {
         "meta": meta,
-        "ufs": int(_scalar(conn, "SELECT COUNT(*) FROM uf_config") or 0),
-        "secoes": int(_scalar(conn, "SELECT COUNT(*) FROM secoes") or 0),
-        "municipios": int(_scalar(conn, "SELECT COUNT(DISTINCT uf || '-' || municipio_cd) FROM secoes") or 0),
+        "ufs": ufs_n,
+        "secoes": secoes,
+        "municipios": municipios,
         "aux_ok": aux_ok,
-        "aux_total": int(_scalar(conn, "SELECT COUNT(*) FROM aux") or 0),
-        "cargas": int(_scalar(conn, "SELECT COUNT(*) FROM cargas") or 0),
+        "aux_total": aux_total,
+        "cargas": cargas,
         "logs_ok": logs_ok,
         "logs_pending": logs_pending,
         "logs_total": logs_ok + logs_pending,
@@ -116,6 +149,62 @@ def ufs(conn: sqlite3.Connection, modelo: Optional[str] = None) -> list[dict[str
         r["uf"]: dict(r)
         for r in _rows(conn, "SELECT uf, nome, n_secoes, dg, hg FROM uf_config")
     }
+
+    # Sem filtro: preferir painel_uf (sem JOIN em arquivos/BLOB).
+    if not modelo:
+        try:
+            painel_rows = _rows(
+                conn,
+                "SELECT uf, n_secoes, logs_ok, aux_ok, bytes_ok FROM painel_uf",
+            )
+        except sqlite3.OperationalError:
+            painel_rows = []
+        if painel_rows:
+            municipios = {
+                r["uf"]: r["c"]
+                for r in _rows(
+                    conn,
+                    "SELECT uf, COUNT(DISTINCT municipio_cd) c FROM secoes GROUP BY uf",
+                )
+            }
+            totalizada = {
+                r["uf"]: r["c"]
+                for r in _rows(
+                    conn,
+                    """
+                    SELECT s.uf, COUNT(*) c
+                    FROM aux a JOIN secoes s ON s.id = a.secao_id
+                    WHERE a.st = 'Totalizada'
+                    GROUP BY s.uf
+                    """,
+                )
+            }
+            out = []
+            for r in painel_rows:
+                uf = str(r["uf"]).lower()
+                n = int(r["n_secoes"] or 0)
+                lo = int(r["logs_ok"] or 0)
+                ao = int(r["aux_ok"] or 0)
+                cfg = configs.get(uf, {})
+                out.append(
+                    {
+                        "uf": uf,
+                        "nome": uf_display_name(uf, cfg.get("nome")),
+                        "ibge": next((k for k, v in IBGE_UF.items() if v == uf), None),
+                        "n_secoes": int(cfg.get("n_secoes") or n),
+                        "secoes": n,
+                        "municipios": int(municipios.get(uf, 0)),
+                        "aux_ok": ao,
+                        "totalizada": int(totalizada.get(uf, 0)),
+                        "logs_ok": lo,
+                        "bytes_ok": int(r["bytes_ok"] or 0),
+                        "cobertura_aux": (ao / n) if n else 0,
+                        "cobertura_log": (lo / n) if n else 0,
+                    }
+                )
+            out.sort(key=lambda row: row["logs_ok"], reverse=True)
+            return out
+
     secoes = {
         r["uf"]: r["c"]
         for r in _rows(conn, f"SELECT uf, COUNT(*) c FROM secoes{modelo_secoes} GROUP BY uf", modelo_params)
@@ -154,34 +243,22 @@ def ufs(conn: sqlite3.Connection, modelo: Optional[str] = None) -> list[dict[str
             modelo_params,
         )
     }
+    # logs via secoes.modelo_urna — evita JOIN em arquivos.content
     logs_ok = {
         r["uf"]: r["c"]
         for r in _rows(
             conn,
             f"""
-            SELECT s.uf, COUNT(*) c
-            FROM arquivos ar
-            JOIN secoes s ON s.id = ar.secao_id
-            WHERE ar.tipo = 'log' AND ar.status = 'ok'{modelo_join}
-            GROUP BY s.uf
+            SELECT uf, COUNT(*) c
+            FROM secoes
+            WHERE modelo_urna IS NOT NULL AND TRIM(modelo_urna) != ''
+            {(' AND modelo_urna = ?' if modelo else '')}
+            GROUP BY uf
             """,
             modelo_params,
         )
     }
-    logs_bytes = {
-        r["uf"]: r["b"]
-        for r in _rows(
-            conn,
-            f"""
-            SELECT s.uf, COALESCE(SUM(ar.size_bytes),0) b
-            FROM arquivos ar
-            JOIN secoes s ON s.id = ar.secao_id
-            WHERE ar.tipo = 'log' AND ar.status = 'ok'{modelo_join}
-            GROUP BY s.uf
-            """,
-            modelo_params,
-        )
-    }
+    logs_bytes: dict[str, int] = {}
     # Com filtro de modelo, só UFs que têm seções daquele modelo.
     keys = sorted(
         (set(secoes) if modelo else (set(configs) | set(secoes))),
@@ -249,51 +326,27 @@ def apuracao(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def tamanhos(conn: sqlite3.Connection) -> dict[str, Any]:
-    stats = conn.execute(
-        """
-        SELECT COUNT(*) n,
-               COALESCE(MIN(size_bytes),0) mn,
-               COALESCE(MAX(size_bytes),0) mx,
-               COALESCE(AVG(size_bytes),0) av
-        FROM arquivos
-        WHERE tipo = 'log' AND status = 'ok' AND size_bytes IS NOT NULL
-        """
-    ).fetchone()
-    n = int(stats["n"] or 0)
-    if not n:
-        return {"n": 0, "min": 0, "max": 0, "avg": 0, "p50": 0, "histogram": []}
-    p50 = int(
-        _scalar(
-            conn,
-            """
-            SELECT size_bytes FROM arquivos
-            WHERE tipo = 'log' AND status = 'ok' AND size_bytes IS NOT NULL
-            ORDER BY size_bytes
-            LIMIT 1 OFFSET ?
-            """,
-            (n // 2,),
-        )
-        or 0
-    )
-    hist_rows = _rows(
-        conn,
-        """
-        SELECT (size_bytes / 25000) * 25000 AS bucket, COUNT(*) c
-        FROM arquivos
-        WHERE tipo = 'log' AND status = 'ok' AND size_bytes IS NOT NULL
-        GROUP BY bucket
-        ORDER BY bucket
-        """,
-    )
-    histogram = [{"from": int(r["bucket"]), "to": int(r["bucket"]) + 25000, "count": r["c"]} for r in hist_rows]
-    return {
-        "n": n,
-        "min": int(stats["mn"]),
-        "max": int(stats["mx"]),
-        "avg": float(stats["av"]),
-        "p50": p50,
-        "histogram": histogram,
-    }
+    """Distribuição de tamanho — usa painel_stats quando possível (evita SUM em BLOB)."""
+    try:
+        painel = conn.execute(
+            "SELECT logs_ok, bytes_ok FROM painel_stats WHERE id=1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        painel = None
+    if painel and int(painel["logs_ok"] or 0) > 0:
+        n = int(painel["logs_ok"] or 0)
+        avg = (int(painel["bytes_ok"] or 0) / n) if n else 0.0
+        return {
+            "n": n,
+            "min": 0,
+            "max": 0,
+            "avg": avg,
+            "p50": 0,
+            "histogram": [],
+            "source": "painel_stats",
+        }
+    # Sem painel: não varrer arquivos.content — devolve vazio.
+    return {"n": 0, "min": 0, "max": 0, "avg": 0, "p50": 0, "histogram": [], "source": "none"}
 
 
 def municipios(
@@ -365,15 +418,7 @@ def _pl_pt_numeros(conn: sqlite3.Connection) -> tuple[str, str]:
 
 
 def modelos(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Votos válidos de Presidente por modelo de urna (BU) + fatia faltante.
-
-    Segmentos = SUM(votos_secao.votos_validos) por modelo_urna.
-    Faltando = max(0, votos_validos oficiais BR em votos_abr − soma já atribuída).
-    Se o oficial for menor que a soma (amostra/quirks), faltando=0.
-
-    Sem votos_secao (ex.: import só de logs), cai no inventário de seções/logs
-    por modelo_urna para o painel acompanhar a eleição ativa.
-    """
+    """Votos por modelo (BU/CSV) ou inventário de seções — sem varrer arquivos/BLOB."""
     MISSING_LABEL = "(faltando)"
 
     br_row = conn.execute(
@@ -382,51 +427,63 @@ def modelos(conn: sqlite3.Connection) -> dict[str, Any]:
     votos_validos_br = int(br_row["votos_validos"] or 0) if br_row else 0
 
     num_pl, num_pt = _pl_pt_numeros(conn)
-    bu_rows = _rows(
-        conn,
-        """
-        SELECT modelo_urna AS modelo,
-               COUNT(*) AS n_secoes_bu,
-               COALESCE(SUM(votos_validos), 0) AS votos_validos
-        FROM votos_secao
-        WHERE status = 'ok'
-          AND modelo_urna IS NOT NULL
-          AND modelo_urna != ''
-          AND modelo_urna NOT LIKE '(%'
-        GROUP BY modelo_urna
-        ORDER BY votos_validos DESC, modelo
-        """,
-    )
 
-    total_com_log = int(
+    try:
+        painel = conn.execute(
+            "SELECT logs_ok, secoes FROM painel_stats WHERE id=1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        painel = None
+    if painel:
+        total_com_log = int(painel["logs_ok"] or 0)
+    else:
+        total_com_log = int(
+            _scalar(
+                conn,
+                """
+                SELECT COUNT(*) FROM secoes
+                WHERE modelo_urna IS NOT NULL AND TRIM(modelo_urna) != ''
+                """,
+            )
+            or 0
+        )
+
+    n_bu = int(
         conn.execute(
-            "SELECT COUNT(*) FROM arquivos WHERE tipo = 'log' AND status = 'ok'"
+            """
+            SELECT COUNT(*) FROM votos_secao
+            WHERE status = 'ok'
+              AND modelo_urna IS NOT NULL
+              AND modelo_urna != ''
+              AND modelo_urna NOT LIKE '(%'
+            """
         ).fetchone()[0]
         or 0
     )
-
-    # Fallback: só logs / seções (sem BU parseado nesta eleição).
-    if not bu_rows:
-        inv_rows = _rows(
-            conn,
-            """
-            SELECT COALESCE(NULLIF(modelo_urna, ''), '(não identificado)') AS modelo,
-                   COUNT(*) AS n_secoes
-            FROM secoes
-            WHERE modelo_urna IS NOT NULL AND modelo_urna != '' AND modelo_urna NOT LIKE '(%'
-            GROUP BY 1
-            ORDER BY n_secoes DESC, modelo
-            """,
-        )
+    # Com qualquer BU parseado, mostra votos reais por modelo (+ faltando).
+    # Antes exigia ≥50% dos logs e caía em inventário de seções (sem PL/PT).
+    use_bu = n_bu > 0
+    if not use_bu:
+        inv_rows: list[Any] = []
+        try:
+            inv_rows = _rows(
+                conn,
+                """
+                SELECT modelo, n_secoes
+                FROM painel_modelo
+                ORDER BY n_secoes DESC, modelo
+                """,
+            )
+        except sqlite3.OperationalError:
+            inv_rows = []
         if not inv_rows:
             inv_rows = _rows(
                 conn,
                 """
                 SELECT COALESCE(NULLIF(modelo_urna, ''), '(não identificado)') AS modelo,
                        COUNT(*) AS n_secoes
-                FROM arquivos
-                WHERE tipo = 'log' AND status = 'ok'
-                  AND modelo_urna IS NOT NULL AND modelo_urna != '' AND modelo_urna NOT LIKE '(%'
+                FROM secoes
+                WHERE modelo_urna IS NOT NULL AND modelo_urna != ''
                 GROUP BY 1
                 ORDER BY n_secoes DESC, modelo
                 """,
@@ -445,7 +502,7 @@ def modelos(conn: sqlite3.Connection) -> dict[str, Any]:
                 "votos_validos": 0,
                 "n_secoes_bu": 0,
                 "n_secoes": int(r["n_secoes"] or 0),
-                "filterable": True,
+                "filterable": str(r["modelo"] or "").upper().startswith("UE"),
                 "missing": False,
                 "metric": "secoes",
                 "numero_pl": num_pl,
@@ -456,18 +513,34 @@ def modelos(conn: sqlite3.Connection) -> dict[str, Any]:
         return {
             "total_com_log": total_com_log,
             "votos_validos_br": votos_validos_br,
-            "votos_atribuidos": 0,
+            "votos_atribuidos": sum(int(i["n_secoes"]) for i in items if i["filterable"]),
             "votos_faltando": 0,
             "numero_pl": num_pl,
             "numero_pt": num_pt,
             "source": "inventario",
             "hint": (
-                "Sem votos_secao nesta eleição: gráfico/tabela mostram seções com log "
-                "por modelo_urna. PL/PT ficam vazios até sincronizar BUs."
+                "Tabela = seções com log por modelo (painel_modelo). "
+                "PL/PT só aparecem com BU/CSV por seção em escala comparável aos logs."
             ),
             "items": items,
             "por_uf": [],
         }
+
+    bu_rows = _rows(
+        conn,
+        """
+        SELECT modelo_urna AS modelo,
+               COUNT(*) AS n_secoes_bu,
+               COALESCE(SUM(votos_validos), 0) AS votos_validos
+        FROM votos_secao
+        WHERE status = 'ok'
+          AND modelo_urna IS NOT NULL
+          AND modelo_urna != ''
+          AND modelo_urna NOT LIKE '(%'
+        GROUP BY modelo_urna
+        ORDER BY votos_validos DESC, modelo
+        """,
+    )
 
     bu_votos: dict[str, dict[str, int]] = defaultdict(lambda: {"votos_pl": 0, "votos_pt": 0})
     for r in _rows(
@@ -491,7 +564,7 @@ def modelos(conn: sqlite3.Connection) -> dict[str, Any]:
     faltando = max(0, votos_validos_br - soma_atribuida)
     denom = votos_validos_br if votos_validos_br > 0 else (soma_atribuida + faltando)
 
-    items: list[dict[str, Any]] = []
+    items = []
     for r in bu_rows:
         modelo = r["modelo"]
         votos_validos = int(r["votos_validos"] or 0)
@@ -555,9 +628,9 @@ def modelos(conn: sqlite3.Connection) -> dict[str, Any]:
         "numero_pt": num_pt,
         "source": "votos_secao",
         "hint": (
-            "Faltando = max(0, votos_validos oficiais BR - soma dos votos_validos "
-            "ja atribuidos a modelos via BU/votos_secao). Logs/BU incompletos "
-            "entram nessa fatia. Se o oficial for menor que a soma, faltando=0."
+            "Votos = soma de votos_validos do BU por modelo_urna. "
+            "Faltando = max(0, oficiais BR − soma já atribuída). "
+            "Cobertura parcial enquanto os BUs ainda estão sendo baixados com os logs."
         ),
         "items": items,
         "por_uf": [],

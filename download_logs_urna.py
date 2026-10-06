@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Baixa logs da urna (log-da-urna) do portal público Resultados do TSE
+Baixa logs da urna (log-da-urna) e BUs do portal público Resultados do TSE
 e grava em SQLite, com retomada (resume), retries e limite de taxa.
+
+Os BUs são parseados para votos de Presidente (votos_secao) — usados na
+aba Modelos (totais e % PL/PT por modelo de urna).
 """
 
 from __future__ import annotations
@@ -64,7 +67,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--skip-discover", action="store_true", help="Pula descoberta de seções (CS)")
     p.add_argument("--skip-aux", action="store_true", help="Pula download de aux.json")
     p.add_argument("--skip-logs", action="store_true", help="Pula download dos .jez")
+    p.add_argument("--skip-bus", action="store_true", help="Pula download/parse dos BUs")
     p.add_argument("--no-blob", action="store_true", help="Não guarda BLOB do .jez")
+    p.add_argument(
+        "--store-bu-blob",
+        action="store_true",
+        help="Guarda BLOB do BU no SQLite (aumenta muito o DB; padrão: só parseia votos)",
+    )
     p.add_argument(
         "--extract-text",
         action="store_true",
@@ -125,16 +134,33 @@ def main(argv: list[str] | None = None) -> int:
                 chunk = batch if total_budget is None else min(batch, total_budget)
                 n_aux = 0 if args.skip_aux else dl.download_aux(ufs, limit=chunk)
                 n_logs = 0 if args.skip_logs else dl.download_logs(ufs, limit=chunk)
-                logging.info("Lote concluído aux=%s logs=%s stats=%s", n_aux, n_logs, db.stats())
+                n_bus = (
+                    0
+                    if args.skip_bus
+                    else dl.download_bus(
+                        ufs, limit=chunk, store_blob=args.store_bu_blob
+                    )
+                )
+                logging.info(
+                    "Lote concluído aux=%s logs=%s bus=%s stats=%s",
+                    n_aux,
+                    n_logs,
+                    n_bus,
+                    db.stats(),
+                )
                 if total_budget is not None:
                     total_budget -= chunk
-                if n_aux == 0 and n_logs == 0:
+                if n_aux == 0 and n_logs == 0 and n_bus == 0:
                     break
         else:
             if not args.skip_aux:
                 dl.download_aux(ufs, limit=total_budget)
             if not args.skip_logs:
                 dl.download_logs(ufs, limit=total_budget)
+            if not args.skip_bus:
+                dl.download_bus(
+                    ufs, limit=total_budget, store_blob=args.store_bu_blob
+                )
 
         stats = db.stats()
         logging.info("Concluído. DB=%s stats=%s", args.db, stats)

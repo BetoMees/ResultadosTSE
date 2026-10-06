@@ -50,70 +50,20 @@ def pending_bus(
     limit: Optional[int] = None,
     include_without_modelo: bool = False,
 ) -> list[Any]:
-    sql = """
-        SELECT
-            a.id AS arquivo_id,
-            a.nome,
-            a.status AS arquivo_status,
-            c.hash,
-            s.id AS secao_id,
-            s.uf,
-            s.municipio_cd,
-            s.zona,
-            s.secao,
-            COALESCE(
-                NULLIF(s.modelo_urna, ''),
-                (
-                    SELECT l.modelo_urna FROM arquivos l
-                    WHERE l.secao_id = s.id AND l.tipo = 'log' AND l.status = 'ok'
-                      AND l.modelo_urna LIKE 'UE%'
-                    LIMIT 1
-                )
-            ) AS modelo_urna
-        FROM arquivos a
-        JOIN cargas c ON c.id = a.carga_id
-        JOIN secoes s ON s.id = a.secao_id
-        WHERE a.tipo = 'bu'
-          AND NOT EXISTS (
-              SELECT 1 FROM votos_secao v
-              WHERE v.secao_id = a.secao_id AND v.status IN ('ok', 'empty')
-          )
-    """
-    params: list[Any] = []
-    if not include_without_modelo:
-        sql += """
-          AND COALESCE(
-                NULLIF(s.modelo_urna, ''),
-                (
-                    SELECT l.modelo_urna FROM arquivos l
-                    WHERE l.secao_id = s.id AND l.tipo = 'log' AND l.status = 'ok'
-                      AND l.modelo_urna LIKE 'UE%'
-                    LIMIT 1
-                )
-              ) LIKE 'UE%'
-        """
-    if ufs:
-        ph = ",".join("?" for _ in ufs)
-        sql += f" AND s.uf IN ({ph})"
-        params.extend(ufs)
-    if modelos:
-        ph = ",".join("?" for _ in modelos)
-        sql += f"""
-          AND COALESCE(
-                NULLIF(s.modelo_urna, ''),
-                (
-                    SELECT l.modelo_urna FROM arquivos l
-                    WHERE l.secao_id = s.id AND l.tipo = 'log' AND l.status = 'ok'
-                      AND l.modelo_urna LIKE 'UE%'
-                    LIMIT 1
-                )
-              ) IN ({ph})
-        """
-        params.extend(modelos)
-    sql += " ORDER BY s.uf, s.municipio_cd, s.zona, s.secao"
-    if limit:
-        sql += f" LIMIT {int(limit)}"
-    return list(db.conn.execute(sql, params))
+    rows = db.pending_bus(ufs=ufs, limit=limit)
+    if include_without_modelo and not modelos:
+        return list(rows)
+    out = []
+    for r in rows:
+        modelo = r["modelo_urna"]
+        if modelos:
+            if modelo not in modelos:
+                continue
+        elif not include_without_modelo:
+            if not modelo or not str(modelo).startswith("UE"):
+                continue
+        out.append(r)
+    return out
 
 
 def _fetch_one(

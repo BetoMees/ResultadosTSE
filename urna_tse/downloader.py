@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .api import DEFAULT_UFS, TseResultadosClient, pad
+from .bu_parser import extract_presidente_votes
 from .db import Database
 from .modelo import parse_modelo_from_jez, parse_modelo_from_text
 
@@ -167,6 +168,11 @@ class UrnaLogDownloader:
             self.db.commit()
             total_new += max(inserted, 0)
             log.info("UF %s: %s seções no CS (%s novas)", uf, len(rows), max(inserted, 0))
+        if total_new or ufs:
+            try:
+                self.db.rebuild_painel_stats()
+            except Exception:  # noqa: BLE001
+                log.exception("rebuild painel_stats após discover falhou")
         return total_new
 
     def _fetch_aux(self, row: Any) -> dict[str, Any]:
@@ -239,6 +245,10 @@ class UrnaLogDownloader:
                     self.db.commit()
                     log.info("aux progresso: %s/%s", done, len(pending))
         self.db.commit()
+        try:
+            self.db.rebuild_painel_stats()
+        except Exception:  # noqa: BLE001
+            log.exception("rebuild painel_stats após aux falhou")
         return done
 
     def _fetch_log(self, row: Any) -> dict[str, Any]:
@@ -310,6 +320,151 @@ class UrnaLogDownloader:
                 done += 1
                 if done % 50 == 0:
                     self.db.commit()
+                    try:
+                        self.db.rebuild_painel_stats()
+                    except Exception:  # noqa: BLE001
+                        log.exception("rebuild painel_stats falhou")
                     log.info("logs progresso: %s/%s | stats=%s", done, len(pending), self.db.stats())
         self.db.commit()
+        try:
+            self.db.rebuild_painel_stats()
+        except Exception:  # noqa: BLE001
+            log.exception("rebuild painel_stats falhou")
+        return done
+
+    def _candidate_numbers(self) -> set[int]:
+        rows = self.db.conn.execute(
+            "SELECT numero FROM votos_candidatos WHERE abr='br'"
+        ).fetchall()
+        out: set[int] = set()
+        for r in rows:
+            try:
+                out.add(int(r["numero"]))
+            except (TypeError, ValueError):
+                continue
+        if not out:
+            # fallback típico 2026 / 2022
+            out = {12, 13, 14, 15, 16, 21, 22, 27, 29, 30, 35, 44, 55, 70, 80}
+        return out
+
+    def download_bus(
+        self,
+        ufs: Optional[list[str]] = None,
+        limit: Optional[int] = None,
+        *,
+        store_blob: bool = False,
+    ) -> int:
+        """Baixa BUs pendentes, extrai votos de Presidente e grava em votos_secao."""
+        if not self.ciclo:
+            self.bootstrap()
+        pending = self.db.pending_bus(ufs, limit)
+        if not pending:
+            log.info("Nenhum BU pendente")
+            return 0
+        cands = self._candidate_numbers()
+        log.info(
+            "Baixando %s BUs (workers=%s, cands=%s)",
+            len(pending),
+            self.workers,
+            sorted(cands),
+        )
+        done = 0
+        ok = empty = http_err = fail = 0
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = [pool.submit(self._fetch_log, row) for row in pending]
+            for fut in as_completed(futures):
+                now = utc_now()
+                try:
+                    result = fut.result()
+                    meta = result["meta"]
+                    arquivo_id = int(result["arquivo_id"])
+                    secao_id = int(meta["secao_id"])
+                    modelo = meta["modelo_urna"] if "modelo_urna" in meta.keys() else None
+                    if result["status"] != 200 or not result["content"]:
+                        self.db.mark_arquivo(
+                            arquivo_id,
+                            status="missing" if result["status"] == 404 else "error",
+                            url=result["url"],
+                            error=f"HTTP {result['status']}",
+                            downloaded_at=now,
+                        )
+                        self.db.upsert_votos_secao(
+                            secao_id,
+                            modelo_urna=modelo,
+                            uf=meta["uf"],
+                            votos={},
+                            status="error",
+                            error=f"HTTP {result['status']}",
+                            downloaded_at=now,
+                        )
+                        http_err += 1
+                    else:
+                        content = result["content"]
+                        digest = hashlib.sha256(content).hexdigest()
+                        votes = extract_presidente_votes(content, cands)
+                        self.db.mark_arquivo(
+                            arquivo_id,
+                            status="ok",
+                            url=result["url"],
+                            size_bytes=len(content),
+                            sha256=digest,
+                            content=content if store_blob else None,
+                            modelo_urna=modelo if modelo else None,
+                            error=None,
+                            downloaded_at=now,
+                        )
+                        if votes:
+                            self.db.upsert_votos_secao(
+                                secao_id,
+                                modelo_urna=modelo,
+                                uf=meta["uf"],
+                                votos=votes,
+                                status="ok",
+                                error=None,
+                                downloaded_at=now,
+                            )
+                            if modelo and str(modelo).startswith("UE"):
+                                self.db.conn.execute(
+                                    """
+                                    UPDATE secoes SET modelo_urna=?
+                                    WHERE id=? AND (modelo_urna IS NULL OR modelo_urna='')
+                                    """,
+                                    (modelo, secao_id),
+                                )
+                            ok += 1
+                        else:
+                            self.db.upsert_votos_secao(
+                                secao_id,
+                                modelo_urna=modelo,
+                                uf=meta["uf"],
+                                votos={},
+                                status="empty",
+                                error="parser sem votos Presidente",
+                                downloaded_at=now,
+                            )
+                            empty += 1
+                except Exception as exc:  # noqa: BLE001
+                    log.error("BU falhou: %s", exc)
+                    fail += 1
+                done += 1
+                if done % 50 == 0:
+                    self.db.commit()
+                    log.info(
+                        "BUs progresso %s/%s | ok=%s empty=%s http_err=%s fail=%s",
+                        done,
+                        len(pending),
+                        ok,
+                        empty,
+                        http_err,
+                        fail,
+                    )
+        self.db.commit()
+        self.db.set_meta("votos_secao_bu_synced_at", utc_now())
+        log.info(
+            "BUs lote fim: ok=%s empty=%s http_err=%s fail=%s",
+            ok,
+            empty,
+            http_err,
+            fail,
+        )
         return done

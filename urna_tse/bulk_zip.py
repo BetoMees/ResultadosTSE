@@ -215,6 +215,10 @@ class BulkZipImporter:
             now,
         )
         self.db.commit()
+        try:
+            self.db.rebuild_painel_stats()
+        except Exception:  # noqa: BLE001
+            log.exception("rebuild painel_stats falhou após import %s", uf)
         return {"imported": imported, "skipped": skipped, "errors": errors, "members": len(members)}
 
     def run(

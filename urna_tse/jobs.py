@@ -493,12 +493,15 @@ class DownloadJobManager:
 
 
 _COVERAGE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-_COVERAGE_TTL_IDLE = 8.0
-_COVERAGE_TTL_BUSY = 2.0
+_COVERAGE_TTL_IDLE = 15.0
+_COVERAGE_TTL_BUSY = 5.0
 
 
 def election_coverage(election: dict[str, Any]) -> dict[str, Any]:
-    """Cobertura do download: UFs faltando / logs vs seções (modo regional)."""
+    """Cobertura do download via painel_stats / espelho JSON (sem BLOB)."""
+    import json
+    import sqlite3
+
     db_path = DATA / election["db_filename"]
     cache_key = f"{election.get('id')}|{election.get('mode')}|{db_path.name}"
     now = time.time()
@@ -520,84 +523,131 @@ def election_coverage(election: dict[str, Any]) -> dict[str, Any]:
         "secoes": 0,
         "partial": False,
         "complete": False,
+        "updated_at": None,
     }
     if not db_path.exists():
         _COVERAGE_CACHE[cache_key] = (now, empty)
         return dict(empty)
 
-    try:
-        import sqlite3
+    def _from_counts(
+        logs_ok: int, secoes: int, missing: list[str], updated_at=None
+    ) -> dict[str, Any]:
+        missing = list(dict.fromkeys(str(u).lower() for u in missing))
+        if secoes == 0 and logs_ok == 0:
+            missing = list(expected)
+        ufs_done = max(0, len(expected) - sum(1 for u in expected if u in set(missing)))
+        if election.get("mode") == "bulk_zip":
+            partial = bool((logs_ok > 0 or secoes > 0) and missing)
+            complete = not missing and (logs_ok > 0 or secoes > 0)
+        else:
+            partial = bool(logs_ok > 0 and (logs_ok < secoes or missing))
+            complete = secoes > 0 and logs_ok >= secoes and not missing
+        return {
+            "ufs_expected": len(expected),
+            "ufs_done": ufs_done,
+            "ufs_missing": missing,
+            "logs_ok": logs_ok,
+            "secoes": secoes,
+            "partial": partial,
+            "complete": complete,
+            "updated_at": updated_at,
+        }
 
-        uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=5)
+    # 1) Espelho JSON — sem lock no SQLite.
+    mirror = db_path.with_suffix(db_path.suffix + ".painel.json")
+    if mirror.exists():
         try:
-            if election.get("mode") == "bulk_zip":
-                have = {
-                    str(r[0]).lower()
-                    for r in conn.execute("SELECT DISTINCT uf FROM secoes")
-                }
-                missing = [u for u in expected if u not in have]
-                logs_ok = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM arquivos WHERE tipo='log' AND status='ok'"
-                    ).fetchone()[0]
-                    or 0
+            raw = json.loads(mirror.read_text(encoding="utf-8"))
+            info = _from_counts(
+                int(raw.get("logs_ok") or 0),
+                int(raw.get("secoes") or 0),
+                list(raw.get("ufs_missing") or []),
+                raw.get("updated_at"),
+            )
+            _COVERAGE_CACHE[cache_key] = (now, info)
+            return dict(info)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 2) painel_stats (timeout curto).
+    try:
+        uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=1.5)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA busy_timeout=1000")
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
                 )
-                secoes = int(conn.execute("SELECT COUNT(*) FROM secoes").fetchone()[0] or 0)
-                done = len(expected) - len(missing)
-                info = {
-                    "ufs_expected": len(expected),
-                    "ufs_done": done,
-                    "ufs_missing": missing,
-                    "logs_ok": logs_ok,
-                    "secoes": secoes,
-                    "partial": bool(logs_ok > 0 or secoes > 0) and bool(missing),
-                    "complete": not missing and (logs_ok > 0 or secoes > 0),
-                }
-            else:
-                # Regional: UF completa só se logs ok >= seções cadastradas.
-                rows = conn.execute(
+            }
+            if "painel_stats" in tables:
+                row = conn.execute(
+                    "SELECT * FROM painel_stats WHERE id=1"
+                ).fetchone()
+                if row and (
+                    int(row["secoes"] or 0) > 0 or int(row["logs_ok"] or 0) > 0
+                ):
+                    try:
+                        missing = json.loads(row["ufs_missing"] or "[]")
+                        if not isinstance(missing, list):
+                            missing = []
+                    except Exception:
+                        missing = []
+                    info = _from_counts(
+                        int(row["logs_ok"] or 0),
+                        int(row["secoes"] or 0),
+                        missing,
+                        row["updated_at"],
+                    )
+                    _COVERAGE_CACHE[cache_key] = (now, info)
+                    return dict(info)
+            uf_rows = list(
+                conn.execute(
                     """
-                    SELECT s.uf,
+                    SELECT uf,
                            COUNT(*) AS n_secoes,
-                           SUM(CASE WHEN a.status='ok' THEN 1 ELSE 0 END) AS logs_ok
-                    FROM secoes s
-                    LEFT JOIN arquivos a ON a.secao_id = s.id AND a.tipo = 'log'
-                    GROUP BY s.uf
+                           SUM(
+                             CASE WHEN modelo_urna IS NOT NULL AND TRIM(modelo_urna) != ''
+                             THEN 1 ELSE 0 END
+                           ) AS logs_ok
+                    FROM secoes
+                    GROUP BY uf
                     """
-                ).fetchall()
-                by_uf = {str(r[0]).lower(): (int(r[1] or 0), int(r[2] or 0)) for r in rows}
-                if not by_uf:
-                    # sem CS ainda
-                    info = dict(empty)
+                )
+            )
+            by_uf = {
+                str(r["uf"]).lower(): (
+                    int(r["n_secoes"] or 0),
+                    int(r["logs_ok"] or 0),
+                )
+                for r in uf_rows
+            }
+            missing = []
+            for u in expected:
+                n_sec, n_log = by_uf.get(u, (0, 0))
+                if election.get("mode") == "bulk_zip":
+                    if n_sec <= 0 and n_log <= 0:
+                        missing.append(u)
                 else:
-                    ufs_all = sorted(by_uf.keys())
-                    missing = [
-                        u for u in ufs_all if by_uf[u][1] < by_uf[u][0]
-                    ]
-                    # inclui UFs do catálogo que nem entraram no banco
-                    for u in expected:
-                        if u not in by_uf and u not in missing:
-                            missing.append(u)
-                    logs_ok = sum(v[1] for v in by_uf.values())
-                    secoes = sum(v[0] for v in by_uf.values())
-                    done = len(ufs_all) - sum(1 for u in ufs_all if by_uf[u][1] < by_uf[u][0])
-                    info = {
-                        "ufs_expected": max(len(ufs_all), len(expected)),
-                        "ufs_done": max(0, done),
-                        "ufs_missing": missing,
-                        "logs_ok": logs_ok,
-                        "secoes": secoes,
-                        "partial": logs_ok > 0 and logs_ok < secoes,
-                        "complete": secoes > 0 and logs_ok >= secoes and not missing,
-                    }
+                    if n_sec <= 0 or n_log < n_sec:
+                        missing.append(u)
+            info = _from_counts(
+                sum(v[1] for v in by_uf.values()),
+                sum(v[0] for v in by_uf.values()),
+                missing,
+            )
         finally:
             conn.close()
     except Exception:  # noqa: BLE001
+        if hit:
+            return dict(hit[1])
         info = dict(empty)
 
     _COVERAGE_CACHE[cache_key] = (now, info)
     return dict(info)
+
 
 
 def missing_ufs_for_election(election: dict[str, Any]) -> list[str]:
